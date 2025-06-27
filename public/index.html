@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KhmerCoders Bot Dashboard</title>
+    <meta name="description" content="KhmerCoders Bot Dashboard - Real-time community analytics and leaderboards">
+    <link rel="stylesheet" href="./css/style.css">
+</head>
+<body class="dashboard-page">
+    <div class="container">
+        <div class="header">
+            <h1>🤖 KhmerCoders Bot Dashboard</h1>
+            <p>Community Message Tracking & Leaderboards</p>
+        </div>
+        
+        <button class="refresh-btn" onclick="loadDashboard()">🔄 Refresh Data</button>
+        
+        <div class="dashboard">
+            <!-- Overview Stats -->
+            <div class="card">
+                <h3>📊 Overview Statistics</h3>
+                <div id="overview-stats" class="loading">Loading...</div>
+            </div>
+            
+            <!-- Platform Comparison -->
+            <div class="card">
+                <h3>⚖️ Platform Comparison</h3>
+                <div id="platform-comparison" class="loading">Loading...</div>
+            </div>
+        </div>
+        
+        <!-- Leaderboards -->
+        <div class="card">
+            <h3>🏆 Leaderboards</h3>
+            
+            <!-- Platform Tabs -->
+            <div class="tabs">
+                <button class="tab active" onclick="switchPlatform('telegram')">💬 Telegram</button>
+                <button class="tab" onclick="switchPlatform('discord')">🎮 Discord</button>
+            </div>
+            
+            <!-- Period Tabs -->
+            <div class="tabs">
+                <button class="tab active" onclick="switchPeriod('all')">🏆 All Time</button>
+                <button class="tab" onclick="switchPeriod('monthly')">📅 Monthly</button>
+                <button class="tab" onclick="switchPeriod('weekly')">📊 Weekly</button>
+                <button class="tab" onclick="switchPeriod('daily')">📈 Daily</button>
+            </div>
+            
+            <div id="leaderboard" class="leaderboard loading">Loading...</div>
+        </div>
+    </div>
+
+    <script src="./js/dashboard.js"></script>
+</body>
+</html>

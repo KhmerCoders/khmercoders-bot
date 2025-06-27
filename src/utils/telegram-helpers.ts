@@ -2,6 +2,50 @@
 import { TelegramMessage } from "../types/telegram";
 
 /**
+ * Validate Telegram-specific parameters
+ */
+function validateTelegramParams(chatId: string, limit?: number): void {
+  if (!chatId || chatId.trim() === '') {
+    throw new Error('Chat ID is required');
+  }
+  if (limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > 1000)) {
+    throw new Error(`Invalid limit: ${limit}. Must be an integer between 1 and 1000.`);
+  }
+}
+
+/**
+ * Safely execute D1 database mutation for Telegram operations
+ */
+async function executeTelegramMutation(
+  preparedStatement: D1PreparedStatement,
+  operation: string
+): Promise<D1Result> {
+  try {
+    const result = await preparedStatement.run();
+    return result;
+  } catch (error) {
+    console.error(`D1Database error in ${operation}:`, error);
+    throw new Error(`Database operation failed: ${operation}`);
+  }
+}
+
+/**
+ * Safely execute D1 database query for Telegram operations
+ */
+async function executeTelegramQuery<T>(
+  preparedStatement: D1PreparedStatement,
+  operation: string
+): Promise<D1Result<T>> {
+  try {
+    const result = await preparedStatement.all();
+    return result as D1Result<T>;
+  } catch (error) {
+    console.error(`D1Database error in ${operation}:`, error);
+    throw new Error(`Database operation failed: ${operation}`);
+  }
+}
+
+/**
  * Record a message from a Telegram channel or supergroup in the database
  *
  * @param db - D1Database instance
@@ -13,6 +57,10 @@ export async function recordTelegramChannelMessage(
   message: TelegramMessage
 ): Promise<void> {
   try {
+    if (!message || !message.message_id || !message.chat) {
+      throw new Error('Invalid message object provided');
+    }
+
     const timestamp = new Date().toISOString();
     // Convert Telegram timestamp to ISO format
     const messageDate = new Date(message.date * 1000).toISOString();
@@ -20,6 +68,8 @@ export async function recordTelegramChannelMessage(
     const chatId = message.chat.id.toString();
     const chatType = message.chat.type;
     const chatTitle = message.chat.title || "Unknown Channel";
+
+    validateTelegramParams(chatId);
 
     // Get sender info if available
     const senderId = message.from ? message.from.id.toString() : null;
@@ -34,7 +84,9 @@ export async function recordTelegramChannelMessage(
 
     console.log(
       `[${timestamp}] Recording ${chatType} message from chat: ${chatTitle} (${chatId})`
-    ); // Determine media type if any
+    ); 
+    
+    // Determine media type if any
     let mediaType = null;
     if (message.photo) mediaType = "photo";
     if (message.video) mediaType = "video";
@@ -66,7 +118,7 @@ export async function recordTelegramChannelMessage(
     const messageThreadId = message.message_thread_id?.toString() || null;
 
     // Insert message into the database
-    await db
+    const statement = db
       .prepare(
         `INSERT INTO telegram_channel_messages (
           message_id, 
@@ -188,32 +240,37 @@ export async function fetchRecentMessages(
   }>
 > {
   try {
+    validateTelegramParams(chatId, limit);
+    
     let query = `SELECT message_text, sender_name, message_date, message_thread_id FROM telegram_channel_messages 
                 WHERE chat_id = ? AND message_text != ''`;
 
-    const params = [chatId];
+    const params = [chatId.trim()];
     // Add thread filter if threadId is provided
-    if (threadId) {
+    if (threadId && threadId.trim() !== '') {
       query += ` AND message_thread_id = ?`;
-      params.push(threadId);
+      params.push(threadId.trim());
     }
 
     query += ` ORDER BY message_date DESC LIMIT ?`;
     params.push(limit.toString());
 
-    const messages = await db
-      .prepare(query)
-      .bind(...params)
-      .all();
+    const statement = db.prepare(query).bind(...params);
+    const result = await executeTelegramQuery<{
+      message_text: string;
+      sender_name: string;
+      message_date: string;
+      message_thread_id?: string;
+    }>(statement, 'fetchRecentMessages');
 
-    return messages.results as Array<{
+    return result.results as Array<{
       message_text: string;
       sender_name: string;
       message_date: string;
       message_thread_id?: string;
     }>;
   } catch (error) {
-    console.error(`Error fetching messages:`, error);
+    console.error(`Error fetching messages for chat ${chatId}:`, error);
     throw error;
   }
 }

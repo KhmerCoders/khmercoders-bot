@@ -7,6 +7,23 @@ import {
   sendTelegramMessage,
   sendTelegramChatAction,
 } from "../utils/telegram-helpers";
+import {
+  getDailyLeaderboard,
+  getWeeklyLeaderboard,
+  getMonthlyLeaderboard,
+  getAllTimeLeaderboard,
+  formatLeaderboardMessage,
+  getUserStats,
+  getPlatformStats,
+} from "../utils/stats-helpers";
+import {
+  commandRateLimiter,
+  summaryRateLimiter,
+  sanitizeInput,
+  detectAbuse,
+  logSecurityEvent,
+  isAdmin,
+} from "../utils/security-helpers";
 
 /**
  * Generate a summary of chat messages using Cloudflare AI
@@ -124,8 +141,23 @@ async function processSummaryCommand(
   const chatId = message.chat.id.toString();
   const timestamp = new Date().toISOString();
   const threadId = message.message_thread_id?.toString();
+  const userId = message.from?.id.toString() || "unknown";
 
   try {
+    // Rate limiting check
+    if (summaryRateLimiter.isRateLimited(userId)) {
+      const resetTime = Math.ceil(summaryRateLimiter.getResetTime(userId) / 1000);
+      await sendTelegramMessage(
+        botToken,
+        chatId,
+        `⏰ Please wait ${resetTime} seconds before requesting another summary.`,
+        threadId,
+        message.message_id
+      );
+      logSecurityEvent("RATE_LIMITED", "Summary command rate limited", userId, "telegram");
+      return;
+    }
+
     console.log(
       `[${timestamp}] Processing /summary command for chat ${chatId}${
         threadId ? `, thread ${threadId}` : ""
@@ -157,8 +189,9 @@ async function processSummaryCommand(
       }`
     );
 
-    // User prompt
-    const userPrompt = message.text?.replace("/summary", "").trim() || "";
+    // User prompt with sanitization
+    const rawPrompt = message.text?.replace("/summary", "").trim() || "";
+    const userPrompt = sanitizeInput(rawPrompt, 500) || "";
 
     // Generate summary
     const summary = await generateChatSummary(userPrompt, messages, c.env.AI);
@@ -285,6 +318,83 @@ function isHelpCommand(text?: string): boolean {
 }
 
 /**
+ * Check if the message is a /stats command
+ *
+ * @param text - Message text
+ * @returns boolean
+ */
+function isStatsCommand(text?: string): boolean {
+  if (!text) return false;
+  return text.startsWith("/stats") || text.startsWith("/leaderboard");
+}
+
+/**
+ * Check if the message is a /mystats command
+ *
+ * @param text - Message text
+ * @returns boolean
+ */
+function isMyStatsCommand(text?: string): boolean {
+  if (!text) return false;
+  return text.startsWith("/mystats") || text.startsWith("/me");
+}
+
+/**
+ * Check if the message is a /leaderboard command
+ *
+ * @param text - Message text
+ * @returns boolean
+ */
+function isLeaderboardCommand(text?: string): boolean {
+  if (!text) return false;
+  return text.startsWith("/leaderboard") || text.startsWith("/top") || text.startsWith("/ranking");
+}
+
+/**
+ * Check if the message is a /daily command
+ *
+ * @param text - Message text
+ * @returns boolean
+ */
+function isDailyCommand(text?: string): boolean {
+  if (!text) return false;
+  return text.startsWith("/daily");
+}
+
+/**
+ * Check if the message is a /weekly command
+ *
+ * @param text - Message text
+ * @returns boolean
+ */
+function isWeeklyCommand(text?: string): boolean {
+  if (!text) return false;
+  return text.startsWith("/weekly");
+}
+
+/**
+ * Check if the message is a /monthly command
+ *
+ * @param text - Message text
+ * @returns boolean
+ */
+function isMonthlyCommand(text?: string): boolean {
+  if (!text) return false;
+  return text.startsWith("/monthly");
+}
+
+/**
+ * Check if the message is an admin command
+ *
+ * @param text - Message text
+ * @returns boolean
+ */
+function isAdminCommand(text?: string): boolean {
+  if (!text) return false;
+  return text.startsWith("/admin") || text.startsWith("/broadcast") || text.startsWith("/cleanup");
+}
+
+/**
  * Process the /help command
  *
  * @param c - Hono context
@@ -300,6 +410,7 @@ async function processHelpCommand(
   const timestamp = new Date().toISOString();
   const threadId = message.message_thread_id?.toString();
   const messageId = message.message_id;
+  const userId = message.from?.id.toString() || "unknown";
 
   try {
     console.log(
@@ -313,12 +424,30 @@ async function processHelpCommand(
     await sendTelegramChatAction(botToken, chatId, "typing", threadId);
     console.log(`[${timestamp}] 'typing' action sent for /help.`);
 
-    const helpMessage = `
-    <b>🤖 Available Commands:</b>
+    let helpMessage = `
+<b>🤖 KhmerCoders Bot - Available Commands:</b>
 
-o /help - Displays this help message.
-o /summary - Summarizes recent chat messages.
-o /ping - Checks if the bot is online.
+<b>📊 Leaderboard Commands:</b>
+• /leaderboard or /top - Show all-time leaderboard
+• /daily - Today's leaderboard
+• /weekly - This week's leaderboard  
+• /monthly - This month's leaderboard
+• /stats [period] - Show leaderboard (supports all periods)
+
+<b>👤 Personal Stats:</b>
+• /mystats or /me - Show your personal statistics
+
+<b>🔧 Utility Commands:</b>
+• /summary [prompt] - Summarize recent chat messages
+• /ping - Check if the bot is online
+• /help - Show this help message
+
+<b>📝 Examples:</b>
+• <code>/leaderboard</code> - All-time top users
+• <code>/daily</code> - Today's most active users
+• <code>/summary what were the main topics?</code> - Custom summary
+
+<i>🏆 Compete with other members and climb the leaderboards!</i>
     `;
 
     await sendTelegramMessage(
@@ -340,6 +469,440 @@ o /ping - Checks if the bot is online.
       botToken,
       chatId,
       "Sorry, an error occurred while processing your help request.",
+      threadId,
+      messageId
+    );
+  }
+}
+
+/**
+ * Process the /stats or /leaderboard command
+ *
+ * @param c - Hono context
+ * @param message - Telegram message
+ * @param botToken - Telegram bot token
+ */
+async function processStatsCommand(
+  c: Context<{ Bindings: CloudflareBindings }>,
+  message: TelegramMessage,
+  botToken: string
+): Promise<void> {
+  const chatId = message.chat.id.toString();
+  const timestamp = new Date().toISOString();
+  const threadId = message.message_thread_id?.toString();
+  const messageId = message.message_id;
+  const userId = message.from?.id.toString() || "unknown";
+
+  try {
+    // Rate limiting check
+    if (commandRateLimiter.isRateLimited(userId)) {
+      const remaining = commandRateLimiter.getRemainingRequests(userId);
+      const resetTime = Math.ceil(commandRateLimiter.getResetTime(userId) / 1000);
+      await sendTelegramMessage(
+        botToken,
+        chatId,
+        `⏰ Command rate limit reached. Try again in ${resetTime} seconds.`,
+        threadId,
+        messageId
+      );
+      return;
+    }
+
+    console.log(
+      `[${timestamp}] Processing /stats command for chat ${chatId}${
+        threadId ? `, thread ${threadId}` : ""
+      }`
+    );
+    
+    await sendTelegramChatAction(botToken, chatId, "typing", threadId);
+
+    // Parse command arguments
+    const commandText = message.text?.toLowerCase() || "";
+    const args = commandText.split(" ");
+    const period = args[1] || "all"; // default to all-time
+
+    let leaderboard;
+    let type: 'daily' | 'weekly' | 'monthly' | 'all-time' = 'all-time';
+
+    switch (period) {
+      case 'daily':
+      case 'today':
+        leaderboard = await getDailyLeaderboard(c.env.DB, "telegram");
+        type = 'daily';
+        break;
+      case 'weekly':
+      case 'week':
+        leaderboard = await getWeeklyLeaderboard(c.env.DB, "telegram");
+        type = 'weekly';
+        break;
+      case 'monthly':
+      case 'month':
+        leaderboard = await getMonthlyLeaderboard(c.env.DB, "telegram");
+        type = 'monthly';
+        break;
+      default:
+        leaderboard = await getAllTimeLeaderboard(c.env.DB, "telegram");
+        type = 'all-time';
+    }
+
+    const formattedMessage = formatLeaderboardMessage(leaderboard, type, "telegram");
+    
+    // Add platform stats
+    const platformStats = await getPlatformStats(c.env.DB, "telegram");
+    const statsFooter = `\n<i>📈 Total: ${platformStats.totalUsers} users, ${platformStats.totalMessages} messages\n👥 Active today: ${platformStats.activeToday} | This week: ${platformStats.activeThisWeek}</i>`;
+
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      formattedMessage + statsFooter,
+      threadId,
+      messageId
+    );
+
+    console.log(
+      `[${timestamp}] Sent ${type} leaderboard to chat ${chatId}${
+        threadId ? `, thread ${threadId}` : ""
+      }`
+    );
+  } catch (error) {
+    console.error(`[${timestamp}] Error processing stats command:`, error);
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      "Sorry, an error occurred while fetching the leaderboard.",
+      threadId,
+      messageId
+    );
+  }
+}
+
+/**
+ * Process the /mystats or /me command
+ *
+ * @param c - Hono context
+ * @param message - Telegram message
+ * @param botToken - Telegram bot token
+ */
+async function processMyStatsCommand(
+  c: Context<{ Bindings: CloudflareBindings }>,
+  message: TelegramMessage,
+  botToken: string
+): Promise<void> {
+  const chatId = message.chat.id.toString();
+  const timestamp = new Date().toISOString();
+  const threadId = message.message_thread_id?.toString();
+  const messageId = message.message_id;
+
+  try {
+    if (!message.from) {
+      await sendTelegramMessage(
+        botToken,
+        chatId,
+        "Sorry, I couldn't identify you to fetch your statistics.",
+        threadId,
+        messageId
+      );
+      return;
+    }
+
+    console.log(
+      `[${timestamp}] Processing /mystats command for user ${message.from.id} in chat ${chatId}${
+        threadId ? `, thread ${threadId}` : ""
+      }`
+    );
+    
+    await sendTelegramChatAction(botToken, chatId, "typing", threadId);
+
+    const userId = message.from.id.toString();
+    const userStats = await getUserStats(c.env.DB, "telegram", userId);
+
+    const displayName = message.from.first_name
+      ? `${message.from.first_name}${
+          message.from.last_name ? " " + message.from.last_name : ""
+        }`
+      : message.from.username || "Unknown User";
+
+    const statsMessage = `
+<b>📊 Personal Statistics for ${displayName}</b>
+
+<b>📈 Message Count:</b>
+• Today: <b>${userStats.daily}</b> messages
+• This Week: <b>${userStats.weekly}</b> messages  
+• This Month: <b>${userStats.monthly}</b> messages
+• All Time: <b>${userStats.allTime}</b> messages
+
+<b>🏆 Ranking:</b>
+${userStats.rank ? `• All-time rank: <b>#${userStats.rank}</b>` : "• Not ranked yet"}
+
+<i>Keep chatting to climb the leaderboards! 🚀</i>
+    `;
+
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      statsMessage,
+      threadId,
+      messageId
+    );
+
+    console.log(
+      `[${timestamp}] Sent personal stats for user ${userId} to chat ${chatId}${
+        threadId ? `, thread ${threadId}` : ""
+      }`
+    );
+  } catch (error) {
+    console.error(`[${timestamp}] Error processing mystats command:`, error);
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      "Sorry, an error occurred while fetching your statistics.",
+      threadId,
+      messageId
+    );
+  }
+}
+
+/**
+ * Process the /leaderboard command
+ *
+ * @param c - Hono context
+ * @param message - Telegram message
+ * @param botToken - Telegram bot token
+ */
+async function processLeaderboardCommand(
+  c: Context<{ Bindings: CloudflareBindings }>,
+  message: TelegramMessage,
+  botToken: string
+): Promise<void> {
+  const chatId = message.chat.id.toString();
+  const timestamp = new Date().toISOString();
+  const threadId = message.message_thread_id?.toString();
+  const messageId = message.message_id;
+  const userId = message.from?.id.toString() || "unknown";
+
+  try {
+    // Rate limiting check
+    if (commandRateLimiter.isRateLimited(userId)) {
+      const resetTime = Math.ceil(commandRateLimiter.getResetTime(userId) / 1000);
+      await sendTelegramMessage(
+        botToken,
+        chatId,
+        `⏰ Command rate limit reached. Try again in ${resetTime} seconds.`,
+        threadId,
+        messageId
+      );
+      return;
+    }
+
+    console.log(
+      `[${timestamp}] Processing /leaderboard command for chat ${chatId}${
+        threadId ? `, thread ${threadId}` : ""
+      }`
+    );
+    
+    await sendTelegramChatAction(botToken, chatId, "typing", threadId);
+
+    // Get all-time leaderboard by default
+    const leaderboard = await getAllTimeLeaderboard(c.env.DB, "telegram", 10);
+    const formattedMessage = formatLeaderboardMessage(leaderboard, 'all-time', "telegram");
+    
+    // Add platform stats
+    const platformStats = await getPlatformStats(c.env.DB, "telegram");
+    const statsFooter = `\n<i>📈 Total: ${platformStats.totalUsers} users, ${platformStats.totalMessages} messages\n👥 Active today: ${platformStats.activeToday} | This week: ${platformStats.activeThisWeek}\n\nUse /daily, /weekly, /monthly for other periods</i>`;
+
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      formattedMessage + statsFooter,
+      threadId,
+      messageId
+    );
+
+    console.log(
+      `[${timestamp}] Sent all-time leaderboard to chat ${chatId}${
+        threadId ? `, thread ${threadId}` : ""
+      }`
+    );
+  } catch (error) {
+    console.error(`[${timestamp}] Error processing leaderboard command:`, error);
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      "Sorry, an error occurred while fetching the leaderboard.",
+      threadId,
+      messageId
+    );
+  }
+}
+
+/**
+ * Process the /daily command
+ *
+ * @param c - Hono context
+ * @param message - Telegram message
+ * @param botToken - Telegram bot token
+ */
+async function processDailyCommand(
+  c: Context<{ Bindings: CloudflareBindings }>,
+  message: TelegramMessage,
+  botToken: string
+): Promise<void> {
+  const chatId = message.chat.id.toString();
+  const timestamp = new Date().toISOString();
+  const threadId = message.message_thread_id?.toString();
+  const messageId = message.message_id;
+  const userId = message.from?.id.toString() || "unknown";
+
+  try {
+    // Rate limiting check
+    if (commandRateLimiter.isRateLimited(userId)) {
+      const resetTime = Math.ceil(commandRateLimiter.getResetTime(userId) / 1000);
+      await sendTelegramMessage(
+        botToken,
+        chatId,
+        `⏰ Command rate limit reached. Try again in ${resetTime} seconds.`,
+        threadId,
+        messageId
+      );
+      return;
+    }
+
+    await sendTelegramChatAction(botToken, chatId, "typing", threadId);
+
+    const leaderboard = await getDailyLeaderboard(c.env.DB, "telegram", undefined, 10);
+    const formattedMessage = formatLeaderboardMessage(leaderboard, 'daily', "telegram");
+    
+    const platformStats = await getPlatformStats(c.env.DB, "telegram");
+    const statsFooter = `\n<i>👥 Active today: ${platformStats.activeToday} users</i>`;
+
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      formattedMessage + statsFooter,
+      threadId,
+      messageId
+    );
+  } catch (error) {
+    console.error(`[${timestamp}] Error processing daily command:`, error);
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      "Sorry, an error occurred while fetching today's leaderboard.",
+      threadId,
+      messageId
+    );
+  }
+}
+
+/**
+ * Process the /weekly command
+ *
+ * @param c - Hono context
+ * @param message - Telegram message
+ * @param botToken - Telegram bot token
+ */
+async function processWeeklyCommand(
+  c: Context<{ Bindings: CloudflareBindings }>,
+  message: TelegramMessage,
+  botToken: string
+): Promise<void> {
+  const chatId = message.chat.id.toString();
+  const timestamp = new Date().toISOString();
+  const threadId = message.message_thread_id?.toString();
+  const messageId = message.message_id;
+  const userId = message.from?.id.toString() || "unknown";
+
+  try {
+    // Rate limiting check
+    if (commandRateLimiter.isRateLimited(userId)) {
+      const resetTime = Math.ceil(commandRateLimiter.getResetTime(userId) / 1000);
+      await sendTelegramMessage(
+        botToken,
+        chatId,
+        `⏰ Command rate limit reached. Try again in ${resetTime} seconds.`,
+        threadId,
+        messageId
+      );
+      return;
+    }
+
+    await sendTelegramChatAction(botToken, chatId, "typing", threadId);
+
+    const leaderboard = await getWeeklyLeaderboard(c.env.DB, "telegram", 10);
+    const formattedMessage = formatLeaderboardMessage(leaderboard, 'weekly', "telegram");
+    
+    const platformStats = await getPlatformStats(c.env.DB, "telegram");
+    const statsFooter = `\n<i>👥 Active this week: ${platformStats.activeThisWeek} users</i>`;
+
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      formattedMessage + statsFooter,
+      threadId,
+      messageId
+    );
+  } catch (error) {
+    console.error(`[${timestamp}] Error processing weekly command:`, error);
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      "Sorry, an error occurred while fetching this week's leaderboard.",
+      threadId,
+      messageId
+    );
+  }
+}
+
+/**
+ * Process the /monthly command
+ *
+ * @param c - Hono context
+ * @param message - Telegram message
+ * @param botToken - Telegram bot token
+ */
+async function processMonthlyCommand(
+  c: Context<{ Bindings: CloudflareBindings }>,
+  message: TelegramMessage,
+  botToken: string
+): Promise<void> {
+  const chatId = message.chat.id.toString();
+  const timestamp = new Date().toISOString();
+  const threadId = message.message_thread_id?.toString();
+  const messageId = message.message_id;
+  const userId = message.from?.id.toString() || "unknown";
+
+  try {
+    // Rate limiting check
+    if (commandRateLimiter.isRateLimited(userId)) {
+      const resetTime = Math.ceil(commandRateLimiter.getResetTime(userId) / 1000);
+      await sendTelegramMessage(
+        botToken,
+        chatId,
+        `⏰ Command rate limit reached. Try again in ${resetTime} seconds.`,
+        threadId,
+        messageId
+      );
+      return;
+    }
+
+    await sendTelegramChatAction(botToken, chatId, "typing", threadId);
+
+    const leaderboard = await getMonthlyLeaderboard(c.env.DB, "telegram", 10);
+    const formattedMessage = formatLeaderboardMessage(leaderboard, 'monthly', "telegram");
+
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      formattedMessage,
+      threadId,
+      messageId
+    );
+  } catch (error) {
+    console.error(`[${timestamp}] Error processing monthly command:`, error);
+    await sendTelegramMessage(
+      botToken,
+      chatId,
+      "Sorry, an error occurred while fetching this month's leaderboard.",
       threadId,
       messageId
     );
@@ -414,6 +977,54 @@ export async function handleTelegramWebhook(
     } else if (message.text && isHelpCommand(message.text)) {
       if (botToken) {
         c.executionCtx.waitUntil(processHelpCommand(c, message, botToken));
+      } else {
+        console.error(
+          `[${timestamp}] Bot token not found in environment variables`
+        );
+      }
+    } else if (message.text && isStatsCommand(message.text)) {
+      if (botToken) {
+        c.executionCtx.waitUntil(processStatsCommand(c, message, botToken));
+      } else {
+        console.error(
+          `[${timestamp}] Bot token not found in environment variables`
+        );
+      }
+    } else if (message.text && isMyStatsCommand(message.text)) {
+      if (botToken) {
+        c.executionCtx.waitUntil(processMyStatsCommand(c, message, botToken));
+      } else {
+        console.error(
+          `[${timestamp}] Bot token not found in environment variables`
+        );
+      }
+    } else if (message.text && isLeaderboardCommand(message.text)) {
+      if (botToken) {
+        c.executionCtx.waitUntil(processLeaderboardCommand(c, message, botToken));
+      } else {
+        console.error(
+          `[${timestamp}] Bot token not found in environment variables`
+        );
+      }
+    } else if (message.text && isDailyCommand(message.text)) {
+      if (botToken) {
+        c.executionCtx.waitUntil(processDailyCommand(c, message, botToken));
+      } else {
+        console.error(
+          `[${timestamp}] Bot token not found in environment variables`
+        );
+      }
+    } else if (message.text && isWeeklyCommand(message.text)) {
+      if (botToken) {
+        c.executionCtx.waitUntil(processWeeklyCommand(c, message, botToken));
+      } else {
+        console.error(
+          `[${timestamp}] Bot token not found in environment variables`
+        );
+      }
+    } else if (message.text && isMonthlyCommand(message.text)) {
+      if (botToken) {
+        c.executionCtx.waitUntil(processMonthlyCommand(c, message, botToken));
       } else {
         console.error(
           `[${timestamp}] Bot token not found in environment variables`

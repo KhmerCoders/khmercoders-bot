@@ -7,6 +7,7 @@ declare namespace Cloudflare {
 		DB: D1Database;
 		AI: Ai;
 		ASSETS: Fetcher;
+        DEV_MODE?: boolean | string
 	}
 }
 interface CloudflareBindings extends Cloudflare.Env {}

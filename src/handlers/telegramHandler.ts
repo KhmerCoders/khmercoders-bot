@@ -31,7 +31,7 @@ export async function handleTelegramWebhook(
     const message = update.message;
 
     // Only count/process messages from supergroups (avoid DMs)
-    if (message.chat.type !== 'supergroup') {
+    if (message.chat.type !== 'supergroup' && !c.env.DEV_MODE) {
       console.log(`[${timestamp}] Ignoring message from non-supergroup chat: ${message.chat.type}`);
       return c.json({
         success: true,

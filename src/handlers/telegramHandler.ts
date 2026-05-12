@@ -3,6 +3,7 @@ import { TelegramUpdate } from '../types/telegram';
 import { isTelegramThreadIdInBlacklist, countUserMessage } from '../utils/db-helpers';
 import { recordTelegramChannelMessage } from '../utils/telegram-helpers';
 import { commands } from '../commands';
+import { containsKcbot, processAIChat } from './aiChatHandler';
 
 /**
  * Handle incoming telegram webhook requests
@@ -103,8 +104,32 @@ export async function handleTelegramWebhook(
       }
     }
 
-    // Only count and record messages for supergroups, not private messages
-    if (message.chat.type === 'supergroup') {
+    // Check if message contains "kcbot" mention (case-insensitive) for AI chat
+    // Only trigger in supergroups (or any chat in DEV_MODE), not commands, and not from bots
+    if (
+      (message.chat.type === 'supergroup' || c.env.DEV_MODE) &&
+      message.text &&
+      containsKcbot(message.text) &&
+      !message.from?.is_bot
+    ) {
+      // Check if any command was matched - if so, don't trigger AI chat
+      let commandMatched = false;
+      for (const command of commands) {
+        if (command.isMatch(message.text)) {
+          commandMatched = true;
+          break;
+        }
+      }
+
+      // Only trigger AI chat if no command was matched
+      if (!commandMatched) {
+        console.log(`[${timestamp}] Detected kcbot mention, triggering AI chat`);
+        c.executionCtx.waitUntil(processAIChat(c, message, botToken));
+      }
+    }
+
+    // Only count and record messages for supergroups (or any chat in DEV_MODE)
+    if (message.chat.type === 'supergroup' || c.env.DEV_MODE) {
       // We can only count messages that have a sender
       if (!message || !message.from) {
         console.log(`[${timestamp}] No sender information in the message`);
